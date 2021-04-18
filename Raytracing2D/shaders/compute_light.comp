@@ -1,0 +1,389 @@
+﻿#version 440 core
+layout( local_size_x = 32, local_size_y = 32 ) in;
+
+layout(rgba32f, binding = 0) uniform image2D image;
+
+uniform float random_seed;
+
+uniform vec2 camera_min;
+uniform vec2 camera_max;
+
+// A single iteration of Bob Jenkins' One-At-A-Time hashing algorithm.
+uint hash( uint x ) {
+    x += ( x << 10u );
+    x ^= ( x >>  6u );
+    x += ( x <<  3u );
+    x ^= ( x >> 11u );
+    x += ( x << 15u );
+    return x;
+}
+
+// Compound versions of the hashing algorithm I whipped together.
+uint hash( uvec2 v ) { return hash( v.x ^ hash(v.y)                         ); }
+uint hash( uvec3 v ) { return hash( v.x ^ hash(v.y) ^ hash(v.z)             ); }
+uint hash( uvec4 v ) { return hash( v.x ^ hash(v.y) ^ hash(v.z) ^ hash(v.w) ); }
+
+// Construct a float with half-open range [0:1] using low 23 bits.
+// All zeroes yields 0.0, all ones yields the next smallest representable value below 1.0.
+float floatConstruct( uint m ) {
+    const uint ieeeMantissa = 0x007FFFFFu; // binary32 mantissa bitmask
+    const uint ieeeOne      = 0x3F800000u; // 1.0 in IEEE binary32
+
+    m &= ieeeMantissa;                     // Keep only mantissa bits (fractional part)
+    m |= ieeeOne;                          // Add fractional part to 1.0
+
+    float  f = uintBitsToFloat( m );       // Range [1:2]
+    return f - 1.0;                        // Range [0:1]
+}
+
+// Pseudo-random value in half-open range [0:1].
+float random( float x ) { return floatConstruct(hash(floatBitsToUint(x))); }
+float random( vec2  v ) { return floatConstruct(hash(floatBitsToUint(v))); }
+float random( vec3  v ) { return floatConstruct(hash(floatBitsToUint(v))); }
+float random( vec4  v ) { return floatConstruct(hash(floatBitsToUint(v))); }
+
+float rand(int seed){ 
+	vec2 co = vec2(gl_GlobalInvocationID.xy);
+
+	return fract(random(vec3(co + seed * vec2(1000.0, 1000.0), random_seed)));
+
+	return fract(sin(dot(co * random_seed + vec2(seed) ,vec2(12.9898,78.233))) * 43758.5453); 
+}
+
+vec2 random_dir(int seed) 
+{
+	float rand_angle = radians(rand(seed + 100) * 360.0);
+	return vec2(cos(rand_angle), sin(rand_angle));
+}
+
+#define MAX_REFLECTIONS 8
+#define EPSILON 0.0001
+#define INFINITY 10000000.0
+
+struct Ray 
+{
+	vec2 origin;
+	vec2 direction;
+	float near;
+	float far;
+};
+
+struct Material 
+{
+	float emissive;
+	float reflective;
+	float refractive;
+	float diffuse;
+
+	vec3 emission_color;
+	vec3 diffuse_color;
+	vec3 eta;
+};
+
+struct IntersectionData 
+{
+	bool intersection;
+	float t;
+	vec2 point;
+	vec2 normal;
+	int material_id;
+};
+
+struct Circle 
+{
+	vec2 center;
+	float radius;
+	int material_id;
+};
+
+struct Triangle
+{
+	vec2 vert_0;
+	vec2 vert_1;
+	vec2 vert_2;
+	int material_id;
+};
+
+layout(std430, binding = 0) buffer MATERIALS 
+{
+	Material materials[];
+};
+
+layout(std430, binding = 1) buffer CIRCLES
+{
+	Circle circles[];
+};
+
+layout(std430, binding = 2) buffer TRIANGLES
+{
+	Triangle triangles[];
+};
+
+layout(std430, binding = 3) buffer WAVELENGTHS
+{
+	// x - wavelength; yzw - color
+	vec4 wavelength_colors[];
+};
+
+IntersectionData IntersectCircle(Ray ray, Circle circle)
+{
+	IntersectionData data = IntersectionData(false, 0.0, vec2(0.0), vec2(0.0), circle.material_id);
+
+	// |(Src + Dir * x) - Center| = R
+	// (Src - Center) = t
+	// dot(t + Dir * x, t + Dir * x) = R^2
+	// dot(t, t) + dot(Dir, Dir) * x^2 + 2 * dot(t, Dir) * x = R^2
+	// |Dir| = 1 so dot(Dir, Dir) = 1
+	// x^2 + 2x * dot(t, Dir) + dot(t, t) - R^2 = 0
+	vec2 t = ray.origin - circle.center;
+	float half_b = dot(t, ray.direction);
+	float quart_discr = half_b * half_b - dot(t, t) + circle.radius * circle.radius;
+	if(quart_discr < 0) return data;
+	
+	float half_sqrt_discr = sqrt(quart_discr);
+
+	float x0 = -half_b - half_sqrt_discr;
+	float x1 = -half_b + half_sqrt_discr;
+	
+	float x0_check = sign((x0 - ray.near) * (ray.far - x0));
+	float x1_check = sign((x1 - ray.near) * (ray.far - x1));
+
+	if (x0_check + x1_check < 0.0) return data;
+
+	data.t = (x0_check + 1.0) * 0.5 * x0 + (1.0 - x0_check) * 0.5 * x1;
+	data.intersection = true;
+	data.point = ray.origin + ray.direction * data.t;
+	data.normal = (data.point - circle.center) / circle.radius;
+
+	return data;
+}
+
+vec2 IntersectLines(vec2 line0_pt0, vec2 line0_pt1, vec2 line1_pt0, vec2 line1_pt1)
+{
+	vec2 intersection = vec2(0.0, 0.0);
+
+    // y1 = k1 * x + t1
+    // y2 = k2 * x + t2
+    // k1 * x + t1 = k2 * x + t2
+    // x * (k1 - k2) = t2 - t1
+    // x = (t2 - t1) / (k1 - k2)
+    // y = k1 * x + t1
+    float k1 = (line0_pt0.y - line0_pt1.y) / (line0_pt0.x - line0_pt1.x);
+    float k2 = (line1_pt0.y - line1_pt1.y) / (line1_pt0.x - line1_pt1.x);
+
+    float t1 = line0_pt0.y - k1 * line0_pt0.x;
+    float t2 = line1_pt0.y - k2 * line1_pt0.x;
+
+    if (k1 > INFINITY || k1 < -INFINITY)
+    {
+        // Means that this line is vertical
+        intersection.x = line0_pt0.x;
+        intersection.y = k2 * intersection.x + t2;
+        return intersection;
+    }
+
+    if (k2 > INFINITY || k2 < -INFINITY)
+    {
+        // Means that passed line is vertical
+        intersection.x = line1_pt0.x;
+        intersection.y = k1 * intersection.x + t1;
+        return intersection;
+    }
+
+    intersection.x = (t2 - t1) / (k1 - k2);
+    intersection.y = k1 * intersection.x + t1;
+
+    return intersection;
+};
+
+IntersectionData IntersectTriangle(Ray ray, Triangle triangle)
+{
+	IntersectionData data = IntersectionData(false, 0.0, vec2(0.0), vec2(0.0), triangle.material_id);
+
+	vec2 ray_point = ray.origin + ray.direction;
+	vec2 i0 = IntersectLines(ray.origin, ray_point, triangle.vert_1, triangle.vert_2);
+	vec2 i1 = IntersectLines(ray.origin, ray_point, triangle.vert_0, triangle.vert_2);
+	vec2 i2 = IntersectLines(ray.origin, ray_point, triangle.vert_0, triangle.vert_1);
+
+	float t0 = ray.near - 1.0;
+	if(dot(triangle.vert_1 - i0, i0 - triangle.vert_2) > 0.0)
+	{
+		if(abs(ray.direction.x) < EPSILON)
+			t0 = (i0.y - ray.origin.y) / ray.direction.y;
+		else
+			t0 = (i0.x - ray.origin.x) / ray.direction.x;
+	}
+
+	float t1 = ray.near - 1.0;
+	if(dot(triangle.vert_0 - i1, i1 - triangle.vert_2) > 0.0)
+	{
+		if(abs(ray.direction.x) < EPSILON)
+			t1 = (i1.y - ray.origin.y) / ray.direction.y;
+		else
+			t1 = (i1.x - ray.origin.x) / ray.direction.x;
+	}
+
+	float t2 = ray.near - 1.0;
+	if(dot(triangle.vert_0 - i2, i2 - triangle.vert_1) > 0.0)
+	{
+		if(abs(ray.direction.x) < EPSILON)
+			t2 = (i2.y - ray.origin.y) / ray.direction.y;
+		else
+			t2 = (i2.x - ray.origin.x) / ray.direction.x;
+	}
+
+	bool t0_good = t0 > ray.near && t0 < ray.far;
+	bool t1_good = t1 > ray.near && t1 < ray.far;
+	bool t2_good = t2 > ray.near && t2 < ray.far;
+
+	if(t0_good && !((t1_good && t1 < t0) || (t2_good && t2 < t0)))
+	{
+		data.intersection = true;
+		data.t = t0;
+		data.point = i0;
+
+		vec2 side = triangle.vert_2 - triangle.vert_1;
+		data.normal = normalize(vec2(-side.y, side.x));
+
+		return data;
+	}
+
+	if(t1_good && !((t0_good && t0 < t1) || (t2_good && t2 < t1)))
+	{
+		data.intersection = true;
+		data.t = t1;
+		data.point = i1;
+		
+		vec2 side = triangle.vert_0 - triangle.vert_2;
+		data.normal = normalize(vec2(-side.y, side.x));
+
+		return data;
+	}
+
+	if(t2_good && !((t1_good && t1 < t2) || (t0_good && t0 < t2)))
+	{
+		data.intersection = true;
+		data.t = t2;
+		data.point = i2;
+		
+		vec2 side = triangle.vert_1 - triangle.vert_0;
+		data.normal = normalize(vec2(-side.y, side.x));
+
+		return data;
+	}
+
+	return data;
+};
+
+IntersectionData trace_ray(Ray ray)
+{
+	IntersectionData data;
+	data.t = INFINITY;
+
+	for(int i = 0; i < circles.length(); i++)
+	{
+		IntersectionData circle_data = IntersectCircle(ray, circles[i]);
+		if(circle_data.intersection && circle_data.t < data.t) data = circle_data;
+	}
+
+	for(int i = 0; i < triangles.length(); i++)
+	{
+		IntersectionData triangle_data = IntersectTriangle(ray, triangles[i]);
+		if(triangle_data.intersection && triangle_data.t < data.t) data = triangle_data;
+	}
+
+	return data;
+}
+
+
+
+float EtaBywavelength(float wavelength, Material material)
+{
+	float inv_wl_sqr = 1.0 / (wavelength * wavelength);
+	return dot(material.eta, vec3(1.0, inv_wl_sqr, inv_wl_sqr * inv_wl_sqr));
+}
+
+vec3 get_color(vec2 pos, float wavelength)
+{
+	vec2 dir = random_dir(0);
+	Ray ray = Ray(pos, dir, EPSILON, INFINITY);
+
+	vec3 color = vec3(1.0);
+
+	for(int i = 0; i < MAX_REFLECTIONS; i++)
+	{
+		IntersectionData data = trace_ray(ray);
+
+		if(!data.intersection) return vec3(0.0);
+
+		// inside the primitive
+		//if(i == 0 && dot(data.normal, ray.direction) > 0.0) { }
+
+		Material material = materials[data.material_id];
+
+		float rand = rand(i + 2) * (material.emissive + material.reflective + material.diffuse + material.refractive);
+
+		if(rand < material.emissive)
+		{// emit
+			return material.emission_color * color;
+		}
+		else if(rand < material.emissive + material.reflective)
+		{// reflect
+			vec2 next_dir = reflect(ray.direction, data.normal);
+			ray = Ray(data.point, next_dir, EPSILON, INFINITY);
+		}
+		else if(rand < material.emissive + material.reflective + material.diffuse)
+		{// diffuse reflect
+			color *= material.diffuse_color;
+
+			vec2 next_dir = random_dir(i + 1);
+			if(dot(next_dir, data.normal) < 0.0)
+				next_dir *= -1;
+
+			ray = Ray(data.point, next_dir, EPSILON, INFINITY);
+		}
+		else
+		{// refract
+			vec2 next_dir = vec2(0.0);
+			float normal_direction = sign(dot(ray.direction, data.normal));
+			
+			float eta = EtaBywavelength(wavelength, material);
+
+			next_dir = refract(ray.direction, -normal_direction * data.normal, pow(eta, normal_direction));
+
+			if(abs(next_dir.x) + abs(next_dir.y) < EPSILON)
+				next_dir = reflect(ray.direction, data.normal);
+			ray = Ray(data.point, next_dir, EPSILON, INFINITY);
+		}
+	}
+
+	return vec3(0.0);
+}
+
+vec2 get_pixel_pos(ivec2 pixel)
+{
+	vec2 img_size = vec2(gl_NumWorkGroups.xy * gl_WorkGroupSize.xy);
+	vec2 pixel_aa = vec2(pixel) + vec2(rand(0), rand(1)) - vec2(0.5);
+	vec2 normalized_pos = pixel_aa / img_size;
+	return camera_min + normalized_pos * (camera_max - camera_min);
+}
+
+void main()
+{
+  ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
+  vec2 pos = get_pixel_pos(pixel_coords);
+
+  vec3 color;
+  vec3 wavelength_color_sum;
+
+  for(int i = 0; i < wavelength_colors.length(); i++)
+  {
+	color += get_color(pos, wavelength_colors[i].x) * wavelength_colors[i].yzw;
+	wavelength_color_sum += wavelength_colors[i].yzw;
+  }
+
+  color /= wavelength_color_sum;
+
+  vec4 curr_color = imageLoad(image, pixel_coords);
+  imageStore(image, pixel_coords, vec4(curr_color.xyz + color, 1.0));
+}
