@@ -17,8 +17,8 @@ namespace Raytracing2D
             GL.LinkProgram(shader_program);
 
             string log = GL.GetProgramInfoLog(shader_program);
-            //if (log != "")
-                //throw new System.Exception(log);
+            if (log != "")
+                throw new System.Exception(log);
 
             return shader_program;
         }

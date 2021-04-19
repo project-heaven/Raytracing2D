@@ -17,6 +17,7 @@
         <Canvas x:Name="RenderRegionCanvas"
                 Width="1024" Height="1024" 
                 HorizontalAlignment="Left" >
+
             <glWpfControl:GLWpfControl 
                 x:Name="RenderRegion" 
                 Render="Redraw" 
@@ -24,9 +25,13 @@
                 Height="1024"
                 MouseDown="RenderRegionMouseDown"
                 MouseMove="RenderRegionMouseMove"
-                MouseWheel="RenderRegionMouseWheel">
-            </glWpfControl:GLWpfControl>
+                MouseWheel="RenderRegionMouseWheel"/>
 
+            <StackPanel>
+                <TextBlock Foreground="Yellow" FontSize="15" x:Name="FPSDisplay">fps</TextBlock>
+                <TextBlock Foreground="Yellow" FontSize="15" x:Name="FrameTimeDisplay">frametime</TextBlock>
+            </StackPanel>
+            
             <Rectangle 
                 x:Name="Selection"
                 Width="100" 

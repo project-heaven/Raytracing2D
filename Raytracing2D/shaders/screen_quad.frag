@@ -9,4 +9,6 @@ uniform float iterations;
 
 void main() {
 	color = vec4(texture2D(image, tex).xyz / iterations, 1.0);
+
+	color.xyz = pow(color.xyz, vec3(1.0 / 2.2));
 }

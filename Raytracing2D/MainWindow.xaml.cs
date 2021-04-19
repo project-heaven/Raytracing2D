@@ -28,6 +28,7 @@ namespace Raytracing2D
                 MajorVersion = 4,
                 MinorVersion = 3
             };
+
             RenderRegion.Start(settings);
         }
 
@@ -36,12 +37,27 @@ namespace Raytracing2D
 
         bool primitive_selected = false;
 
+        int fps_frame = 0;
+        float frametime_avg = 0;
+        const int fps_frames = 5;
+
         void Redraw(TimeSpan delta)
         {
             if (!initialized)
             {
                 initialized = true;
                 scene.Init(1024, 1024);
+            }
+
+            frametime_avg += (float)delta.TotalSeconds;
+            if (++fps_frame == fps_frames)
+            {
+                fps_frame = 0;
+                frametime_avg /= fps_frames;
+                FPSDisplay.Text = "fps: " + (1.0f / frametime_avg).ToString("F0");
+                FrameTimeDisplay.Text = "frame time: " + (frametime_avg * 1000.0f).ToString("F2") + "ms";
+
+                frametime_avg = 0;
             }
 
             scene.Render();
